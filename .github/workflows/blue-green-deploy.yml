@@ -16,7 +16,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Build and Deploy Green
-        shell: pwsh
+        shell: powershell
         env:
           IMAGE_TAG: ${{ github.sha }}
         run: |
