@@ -1,0 +1,18 @@
+
+name: Self-Hosted Runner Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-runner:
+    runs-on: [self-hosted, Windows, X64]
+
+    steps:
+      - name: Check Runner
+        run: |
+          Write-Host "Self-hosted runner is working!"
+          Write-Host "Runner: $env:RUNNER_NAME"
+
+      - name: Check Docker
+        run: docker version
