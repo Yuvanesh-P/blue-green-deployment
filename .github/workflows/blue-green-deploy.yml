@@ -15,13 +15,10 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Deploy to Inactive Environment
+      - name: Deploy and Switch Traffic
         shell: powershell
-        env:
-          IMAGE_TAG: ${{ github.sha }}
         run: |
           $ErrorActionPreference = "Stop"
-          $image = "blue-green-demo:$($env:IMAGE_TAG)"
           $configPath = "E:\Tasks - CW\blue-green-deployment\nginx\nginx.conf"
 
           function Test-Health($url) {
@@ -35,79 +32,111 @@ jobs:
             return $false
           }
 
-          docker build -t $image .
-          if ($LASTEXITCODE -ne 0) { throw "Docker build failed" }
-
           $config = [IO.File]::ReadAllText($configPath)
           $match = [regex]::Match($config, 'server\s+(blue|green):8000;')
-          if (-not $match.Success) { throw "Cannot detect active environment" }
+
+          if (-not $match.Success) {
+            throw "Cannot detect active environment"
+          }
 
           $active = $match.Groups[1].Value
+
           if ($active -eq "blue") {
             $target = "green"
             $port = 8002
+            $version = "v2"
           } else {
             $target = "blue"
             $port = 8001
+            $version = "v1"
           }
 
-          Write-Host "Active: $active; deploying to inactive: $target"
+          $image = "blue-green-demo:$version"
+
+          Write-Host "Active: $active"
+          Write-Host "Target: $target"
+          Write-Host "Image: $image"
+
+          docker image inspect $image | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            throw "Required image not found: $image"
+          }
 
           if ((docker ps -a --format '{{.Names}}') -contains "deploy-candidate") {
             docker rm -f deploy-candidate
-            if ($LASTEXITCODE -ne 0) { throw "Candidate cleanup failed" }
+            if ($LASTEXITCODE -ne 0) {
+              throw "Candidate cleanup failed"
+            }
           }
 
           docker run -d --name deploy-candidate `
             --network bluegreen-net `
             -p 127.0.0.1:8003:8000 `
-            -e "APP_VERSION=$($env:IMAGE_TAG)" `
+            -e "APP_VERSION=$version" `
             -e "APP_COLOR=$target" $image
 
-          if ($LASTEXITCODE -ne 0) { throw "Candidate startup failed" }
+          if ($LASTEXITCODE -ne 0) {
+            throw "Candidate startup failed"
+          }
 
           if (-not (Test-Health "http://127.0.0.1:8003/health")) {
             docker rm -f deploy-candidate
-            throw "Candidate unhealthy; active traffic unchanged"
+            throw "Candidate unhealthy; traffic unchanged"
           }
 
-          Write-Host "Candidate health check passed"
-
           $oldImage = (& docker inspect $target --format '{{.Config.Image}}').Trim()
-          if ($LASTEXITCODE -ne 0) { throw "Cannot inspect old target container" }
+          if ($LASTEXITCODE -ne 0) {
+            docker rm -f deploy-candidate
+            throw "Cannot inspect target container"
+          }
 
-          $oldEnv = (& docker inspect $target --format '{{json .Config.Env}}') | ConvertFrom-Json
-          if ($LASTEXITCODE -ne 0) { throw "Cannot read old target settings" }
+          $oldEnv = (& docker inspect $target --format '{{json .Config.Env}}') |
+            ConvertFrom-Json
+
+          if ($LASTEXITCODE -ne 0) {
+            docker rm -f deploy-candidate
+            throw "Cannot read target settings"
+          }
 
           docker rm -f $target
-          if ($LASTEXITCODE -ne 0) { throw "Cannot replace inactive environment" }
+          if ($LASTEXITCODE -ne 0) {
+            docker rm -f deploy-candidate
+            throw "Cannot remove inactive target"
+          }
 
           try {
             docker run -d --name $target `
               --network bluegreen-net `
               -p "127.0.0.1:${port}:8000" `
-              -e "APP_VERSION=$($env:IMAGE_TAG)" `
+              -e "APP_VERSION=$version" `
               -e "APP_COLOR=$target" $image
 
-            if ($LASTEXITCODE -ne 0) { throw "New target startup failed" }
+            if ($LASTEXITCODE -ne 0) {
+              throw "Target startup failed"
+            }
 
             if (-not (Test-Health "http://127.0.0.1:$port/health")) {
-              throw "New target health check failed"
+              throw "Target health check failed"
             }
           }
           catch {
             docker rm -f $target 2>$null
 
-            $restoreArgs = @("run", "-d", "--name", $target,
+            $restoreArgs = @(
+              "run", "-d", "--name", $target,
               "--network", "bluegreen-net",
-              "-p", "127.0.0.1:${port}:8000")
+              "-p", "127.0.0.1:${port}:8000"
+            )
+
             foreach ($entry in $oldEnv) {
               $restoreArgs += @("-e", $entry)
             }
+
             $restoreArgs += $oldImage
             & docker @restoreArgs
 
-            throw "Deployment failed; old inactive container restoration attempted"
+            docker rm -f deploy-candidate 2>$null
+            throw "Target deployment failed; restoration attempted"
           }
 
           $pattern = 'server\s+' + [regex]::Escape($active) + ':8000;'
@@ -127,7 +156,8 @@ jobs:
             [IO.File]::WriteAllText(
               $configPath, $config, [Text.UTF8Encoding]::new($false)
             )
-            throw "Nginx validation failed; original config restored"
+            docker rm -f deploy-candidate 2>$null
+            throw "Nginx validation failed; config restored"
           }
 
           docker exec nginx-proxy nginx -s reload
@@ -136,8 +166,13 @@ jobs:
               $configPath, $config, [Text.UTF8Encoding]::new($false)
             )
             docker exec nginx-proxy nginx -s reload
-            throw "Nginx reload failed; previous config restoration attempted"
+            docker rm -f deploy-candidate 2>$null
+            throw "Nginx reload failed; previous config restored"
+          }
+
+          if (-not (Test-Health "http://127.0.0.1:8081/health")) {
+            throw "Post-switch health check failed; investigate routing"
           }
 
           docker rm -f deploy-candidate
-          Write-Host "Deployment successful. Traffic switched to $target."
+          Write-Host "Deployment successful. Traffic switched to $target using $version."
