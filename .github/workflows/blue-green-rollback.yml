@@ -1,0 +1,105 @@
+
+name: Blue-Green Rollback
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rollback:
+    runs-on: [self-hosted, Windows, X64]
+
+    steps:
+      - name: Rollback to Previous Environment
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $configPath = "E:\Tasks - CW\blue-green-deployment\nginx\nginx.conf"
+
+          function Get-HealthyResponse($url) {
+            for ($i = 0; $i -lt 15; $i++) {
+              try {
+                $r = Invoke-RestMethod -Uri $url -TimeoutSec 3
+                if ($r.status -eq "healthy") {
+                  return $r
+                }
+              } catch {}
+              Start-Sleep -Seconds 2
+            }
+            return $null
+          }
+
+          $config = [IO.File]::ReadAllText($configPath)
+          $match = [regex]::Match($config, 'server\s+(blue|green):8000;')
+
+          if (-not $match.Success) {
+            throw "Cannot identify active Nginx environment"
+          }
+
+          $active = $match.Groups[1].Value
+
+          if ($active -eq "blue") {
+            $target = "green"
+            $port = 8002
+          } else {
+            $target = "blue"
+            $port = 8001
+          }
+
+          Write-Host "Current active: $active"
+          Write-Host "Rollback target: $target"
+
+          $targetHealth = Get-HealthyResponse "http://127.0.0.1:$port/health"
+
+          if ($null -eq $targetHealth) {
+            throw "Rollback target is unhealthy. Traffic unchanged."
+          }
+
+          if ($targetHealth.environment -ine $target) {
+            throw "Target environment mismatch. Traffic unchanged."
+          }
+
+          $pattern = 'server\s+' + [regex]::Escape($active) + ':8000;'
+          $replacement = "server ${target}:8000;"
+          $updated = [regex]::Replace($config, $pattern, $replacement, 1)
+
+          if ($updated -eq $config) {
+            throw "Unable to update Nginx upstream"
+          }
+
+          [IO.File]::WriteAllText(
+            $configPath, $updated, [Text.UTF8Encoding]::new($false)
+          )
+
+          docker exec nginx-proxy nginx -t
+          if ($LASTEXITCODE -ne 0) {
+            [IO.File]::WriteAllText(
+              $configPath, $config, [Text.UTF8Encoding]::new($false)
+            )
+            throw "Nginx validation failed; original config restored"
+          }
+
+          docker exec nginx-proxy nginx -s reload
+          if ($LASTEXITCODE -ne 0) {
+            [IO.File]::WriteAllText(
+              $configPath, $config, [Text.UTF8Encoding]::new($false)
+            )
+            docker exec nginx-proxy nginx -s reload
+            throw "Nginx reload failed; restoration attempted"
+          }
+
+          $routedHealth = Get-HealthyResponse "http://127.0.0.1:8081/health"
+
+          if (($null -eq $routedHealth) -or
+              ($routedHealth.environment -ine $target)) {
+            [IO.File]::WriteAllText(
+              $configPath, $config, [Text.UTF8Encoding]::new($false)
+            )
+            docker exec nginx-proxy nginx -s reload
+            throw "Post-rollback verification failed; original route restored"
+          }
+
+          Write-Host "Rollback successful. Traffic now routes to $target."
+          Write-Host "Version: $($routedHealth.version)"
