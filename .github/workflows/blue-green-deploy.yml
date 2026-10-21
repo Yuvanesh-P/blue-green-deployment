@@ -15,7 +15,7 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Build and Deploy Green
+      - name: Deploy to Inactive Environment
         shell: powershell
         env:
           IMAGE_TAG: ${{ github.sha }}
@@ -25,7 +25,7 @@ jobs:
           $configPath = "E:\Tasks - CW\blue-green-deployment\nginx\nginx.conf"
 
           function Test-Health($url) {
-            for ($i = 0; $i -lt 20; $i++) {
+            for ($i = 0; $i -lt 15; $i++) {
               try {
                 $r = Invoke-RestMethod -Uri $url -TimeoutSec 3
                 if ($r.status -eq "healthy") { return $true }
@@ -38,94 +38,106 @@ jobs:
           docker build -t $image .
           if ($LASTEXITCODE -ne 0) { throw "Docker build failed" }
 
-          if ((docker ps -a --format '{{.Names}}') -contains "green-candidate") {
-            docker rm -f green-candidate
+          $config = [IO.File]::ReadAllText($configPath)
+          $match = [regex]::Match($config, 'server\s+(blue|green):8000;')
+          if (-not $match.Success) { throw "Cannot detect active environment" }
+
+          $active = $match.Groups[1].Value
+          if ($active -eq "blue") {
+            $target = "green"
+            $port = 8002
+          } else {
+            $target = "blue"
+            $port = 8001
+          }
+
+          Write-Host "Active: $active; deploying to inactive: $target"
+
+          if ((docker ps -a --format '{{.Names}}') -contains "deploy-candidate") {
+            docker rm -f deploy-candidate
             if ($LASTEXITCODE -ne 0) { throw "Candidate cleanup failed" }
           }
 
-          docker run -d --name green-candidate `
+          docker run -d --name deploy-candidate `
             --network bluegreen-net `
             -p 127.0.0.1:8003:8000 `
             -e "APP_VERSION=$($env:IMAGE_TAG)" `
-            -e "APP_COLOR=Green" $image
+            -e "APP_COLOR=$target" $image
 
           if ($LASTEXITCODE -ne 0) { throw "Candidate startup failed" }
 
           if (-not (Test-Health "http://127.0.0.1:8003/health")) {
-            docker rm -f green-candidate
-            throw "Green candidate unhealthy. Blue traffic remains unchanged."
+            docker rm -f deploy-candidate
+            throw "Candidate unhealthy; active traffic unchanged"
           }
 
-          Write-Host "Green candidate health check passed."
+          Write-Host "Candidate health check passed"
 
-          $oldImage = (& docker inspect green --format '{{.Config.Image}}').Trim()
-          if ($LASTEXITCODE -ne 0) { throw "Could not inspect existing Green" }
+          $oldImage = (& docker inspect $target --format '{{.Config.Image}}').Trim()
+          if ($LASTEXITCODE -ne 0) { throw "Cannot inspect old target container" }
 
-          $oldEnv = (& docker inspect green --format '{{json .Config.Env}}') | ConvertFrom-Json
-          if ($LASTEXITCODE -ne 0) { throw "Could not capture Green settings" }
+          $oldEnv = (& docker inspect $target --format '{{json .Config.Env}}') | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "Cannot read old target settings" }
 
-          docker rm -f green
-          if ($LASTEXITCODE -ne 0) { throw "Could not replace old Green" }
+          docker rm -f $target
+          if ($LASTEXITCODE -ne 0) { throw "Cannot replace inactive environment" }
 
           try {
-            docker run -d --name green `
+            docker run -d --name $target `
               --network bluegreen-net `
-              -p 127.0.0.1:8002:8000 `
+              -p "127.0.0.1:${port}:8000" `
               -e "APP_VERSION=$($env:IMAGE_TAG)" `
-              -e "APP_COLOR=Green" $image
+              -e "APP_COLOR=$target" $image
 
-            if ($LASTEXITCODE -ne 0) { throw "Green startup failed" }
+            if ($LASTEXITCODE -ne 0) { throw "New target startup failed" }
 
-            if (-not (Test-Health "http://127.0.0.1:8002/health")) {
-              throw "New Green health check failed"
+            if (-not (Test-Health "http://127.0.0.1:$port/health")) {
+              throw "New target health check failed"
             }
           }
           catch {
-            docker rm -f green 2>$null
-            $restoreArgs = @("run", "-d", "--name", "green",
+            docker rm -f $target 2>$null
+
+            $restoreArgs = @("run", "-d", "--name", $target,
               "--network", "bluegreen-net",
-              "-p", "127.0.0.1:8002:8000")
+              "-p", "127.0.0.1:${port}:8000")
             foreach ($entry in $oldEnv) {
               $restoreArgs += @("-e", $entry)
             }
             $restoreArgs += $oldImage
             & docker @restoreArgs
-            throw
+
+            throw "Deployment failed; old inactive container restoration attempted"
           }
 
-          $originalConfig = [System.IO.File]::ReadAllText($configPath)
-          $updatedConfig = $originalConfig -replace 'server\s+blue:8000;', 'server green:8000;'
+          $pattern = 'server\s+' + [regex]::Escape($active) + ':8000;'
+          $replacement = "server ${target}:8000;"
+          $updated = [regex]::Replace($config, $pattern, $replacement, 1)
 
-          if ($updatedConfig -eq $originalConfig) {
-            throw "Could not find Blue upstream in Nginx config"
+          if ($updated -eq $config) {
+            throw "Cannot update Nginx upstream"
           }
 
-          [System.IO.File]::WriteAllText(
-            $configPath, $updatedConfig,
-            [System.Text.UTF8Encoding]::new($false)
+          [IO.File]::WriteAllText(
+            $configPath, $updated, [Text.UTF8Encoding]::new($false)
           )
 
           docker exec nginx-proxy nginx -t
           if ($LASTEXITCODE -ne 0) {
-            [System.IO.File]::WriteAllText(
-              $configPath, $originalConfig,
-              [System.Text.UTF8Encoding]::new($false)
+            [IO.File]::WriteAllText(
+              $configPath, $config, [Text.UTF8Encoding]::new($false)
             )
-            docker exec nginx-proxy nginx -s reload
-            throw "Nginx validation failed; restored previous config"
+            throw "Nginx validation failed; original config restored"
           }
 
           docker exec nginx-proxy nginx -s reload
           if ($LASTEXITCODE -ne 0) {
-            [System.IO.File]::WriteAllText(
-              $configPath, $originalConfig,
-              [System.Text.UTF8Encoding]::new($false)
+            [IO.File]::WriteAllText(
+              $configPath, $config, [Text.UTF8Encoding]::new($false)
             )
             docker exec nginx-proxy nginx -s reload
-            throw "Nginx reload failed; restored previous config"
+            throw "Nginx reload failed; previous config restoration attempted"
           }
 
-          docker rm -f green-candidate
-          if ($LASTEXITCODE -ne 0) { Write-Warning "Candidate cleanup needed" }
-
-          Write-Host "Deployment successful. Nginx now routes to Green."
+          docker rm -f deploy-candidate
+          Write-Host "Deployment successful. Traffic switched to $target."
