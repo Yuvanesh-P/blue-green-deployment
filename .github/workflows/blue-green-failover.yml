@@ -1,0 +1,114 @@
+
+name: Blue-Green Health Failover
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  failover:
+    runs-on: [self-hosted, Windows, X64]
+
+    steps:
+      - name: Check Health and Fail Over if Needed
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $configPath = "E:\Tasks - CW\blue-green-deployment\nginx\nginx.conf"
+
+          function Get-Health($port) {
+            try {
+              $r = Invoke-RestMethod `
+                -Uri "http://127.0.0.1:$port/health" `
+                -TimeoutSec 3
+              if ($r.status -eq "healthy") { return $r }
+            } catch {}
+            return $null
+          }
+
+          $config = [IO.File]::ReadAllText($configPath)
+          $match = [regex]::Match($config, 'server\s+(blue|green):8000;')
+
+          if (-not $match.Success) {
+            throw "Cannot detect active Nginx environment"
+          }
+
+          $active = $match.Groups[1].Value.ToLower()
+
+          if ($active -eq "blue") {
+            $activePort = 8001
+            $target = "green"
+            $targetPort = 8002
+          } else {
+            $activePort = 8002
+            $target = "blue"
+            $targetPort = 8001
+          }
+
+          Write-Host "Checking active environment: $active"
+
+          $activeHealth = Get-Health $activePort
+
+          if ($null -ne $activeHealth) {
+            Write-Host "Active environment is healthy. No switch required."
+            exit 0
+          }
+
+          Write-Host "WARNING: $active is unhealthy. Checking $target."
+
+          $targetHealth = Get-Health $targetPort
+
+          if ($null -eq $targetHealth) {
+            throw "Both environments unavailable or target unhealthy. No switch performed."
+          }
+
+          if ($targetHealth.environment -ine $target) {
+            throw "Target environment identity mismatch. No switch performed."
+          }
+
+          $updated = [regex]::Replace(
+            $config,
+            'server\s+' + [regex]::Escape($active) + ':8000;',
+            "server ${target}:8000;",
+            1
+          )
+
+          if ($updated -eq $config) {
+            throw "Could not update Nginx upstream"
+          }
+
+          [IO.File]::WriteAllText(
+            $configPath, $updated, [Text.UTF8Encoding]::new($false)
+          )
+
+          docker exec nginx-proxy nginx -t
+          if ($LASTEXITCODE -ne 0) {
+            [IO.File]::WriteAllText(
+              $configPath, $config, [Text.UTF8Encoding]::new($false)
+            )
+            throw "Nginx validation failed. Original config restored."
+          }
+
+          docker exec nginx-proxy nginx -s reload
+          if ($LASTEXITCODE -ne 0) {
+            [IO.File]::WriteAllText(
+              $configPath, $config, [Text.UTF8Encoding]::new($false)
+            )
+            docker exec nginx-proxy nginx -s reload
+            throw "Nginx reload failed. Restoration attempted."
+          }
+
+          $routed = Get-Health 8081
+          if (($null -eq $routed) -or
+              ($routed.environment -ine $target)) {
+            [IO.File]::WriteAllText(
+              $configPath, $config, [Text.UTF8Encoding]::new($false)
+            )
+            docker exec nginx-proxy nginx -s reload
+            throw "Post-switch verification failed. Original route restored."
+          }
+
+          Write-Host "FAILOVER SUCCESSFUL: $active -> $target"
+          Write-Host "Version: $($routed.version)"
